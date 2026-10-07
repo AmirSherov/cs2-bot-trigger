@@ -1,0 +1,45 @@
+# Intermediate build files (main application and standalone packer)
+build/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.res
+*.pch
+*.tlog
+*.lastbuildstate
+
+# Keep the ready-to-run standalone executable in Git
+*.exe
+!/gpu-trigger-standalone.exe
+
+# Python environments, caches and export scratch files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tools/yolo-config/
+tools/Ultralytics/
+models/yolov8n-seg.onnx
+
+# Local IDE settings
+.vs/
+.idea/
+*.user
+*.suo
+
+# Runtime diagnostics and temporary files
+ort-profile*.json
+*.log
+*.tmp
+*.tmp-*
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Required model weights, ONNX model, DLLs, SDK headers and
+# onnxruntime.lib are intentionally included for reproducible builds.
