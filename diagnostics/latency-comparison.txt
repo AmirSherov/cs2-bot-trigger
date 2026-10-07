@@ -1,0 +1,66 @@
+ITER=1 IMAGE=person-near.png VARIANT=baseline ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.866 p95=4.463 | crop_to_decision_ms median=2.968 p95=5.687
+ITER=1 IMAGE=person-near.png VARIANT=optimized ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.526 p95=3.646 | crop_to_decision_ms median=1.699 p95=3.828
+preprocess_ms median=0.160 p95=0.238 | postprocess_ms median=0.002 p95=0.002
+ITER=1 IMAGE=person-group.png VARIANT=baseline ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.772 p95=4.361 | crop_to_decision_ms median=2.868 p95=5.596
+ITER=1 IMAGE=person-group.png VARIANT=optimized ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.527 p95=3.821 | crop_to_decision_ms median=1.693 p95=4.069
+preprocess_ms median=0.157 p95=0.257 | postprocess_ms median=0.002 p95=0.003
+ITER=2 IMAGE=person-near.png VARIANT=baseline ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.793 p95=4.248 | crop_to_decision_ms median=2.891 p95=5.442
+ITER=2 IMAGE=person-near.png VARIANT=optimized ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.535 p95=3.764 | crop_to_decision_ms median=1.725 p95=3.970
+preprocess_ms median=0.168 p95=0.313 | postprocess_ms median=0.002 p95=0.003
+ITER=2 IMAGE=person-group.png VARIANT=baseline ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.799 p95=4.483 | crop_to_decision_ms median=2.951 p95=5.768
+ITER=2 IMAGE=person-group.png VARIANT=optimized ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.529 p95=3.708 | crop_to_decision_ms median=1.695 p95=3.963
+preprocess_ms median=0.164 p95=0.222 | postprocess_ms median=0.002 p95=0.003
+ITER=3 IMAGE=person-near.png VARIANT=baseline ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.767 p95=4.118 | crop_to_decision_ms median=2.851 p95=5.364
+ITER=3 IMAGE=person-near.png VARIANT=optimized ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.636 p95=3.712 | crop_to_decision_ms median=1.919 p95=3.964
+preprocess_ms median=0.229 p95=0.510 | postprocess_ms median=0.002 p95=0.005
+ITER=3 IMAGE=person-group.png VARIANT=baseline ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.800 p95=4.102 | crop_to_decision_ms median=2.897 p95=5.374
+ITER=3 IMAGE=person-group.png VARIANT=optimized ROI=640
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.523 p95=3.666 | crop_to_decision_ms median=1.688 p95=3.969
+preprocess_ms median=0.160 p95=0.224 | postprocess_ms median=0.002 p95=0.003

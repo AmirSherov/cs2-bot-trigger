@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 #include <onnxruntime_cxx_api.h>
 #include <dml_provider_factory.h>
+#include <immintrin.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -33,16 +34,16 @@ void check(HRESULT result, const char* message) {
 bool held(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 double milliseconds(Clock::duration value) { return std::chrono::duration<double, std::milli>(value).count(); }
 double qpcAge(LARGE_INTEGER timestamp) {
-    LARGE_INTEGER now{}, frequency{};
-    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
-    return double(now.QuadPart - timestamp.QuadPart) * 1000.0 / double(frequency.QuadPart);
+    static const double inverseFrequency=[] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return 1000.0/double(f.QuadPart); }();
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    return double(now.QuadPart - timestamp.QuadPart) * inverseFrequency;
 }
 
 struct Options {
     bool live = false;
     bool help = false;
     int device = 0;
-    int roi = 960;
+    int roi = 640;
     int cooldown = 100;
     int holdMs = 8;
     int benchmark = 60;
@@ -50,21 +51,25 @@ struct Options {
     float confidence = 0.45f;
     double maxAge = 40;
     std::wstring model, image, preview, profile;
+    bool explicitModel = false;
+    bool scalar = false;
 };
 Options parse(int argc, wchar_t** argv) {
     Options o;
     wchar_t executable[32768]{};
     if (!GetModuleFileNameW(nullptr, executable, 32768)) throw std::runtime_error("Cannot locate executable");
-    o.model = (std::filesystem::path(executable).parent_path() / L"person-seg-320.onnx").wstring();
+    const auto modelDirectory=std::filesystem::path(executable).parent_path();
+    o.model = (modelDirectory / L"person-seg-fast-320.onnx").wstring();
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         auto value = [&]() -> std::wstring { if (++i >= argc) throw std::runtime_error("Missing argument value"); return argv[i]; };
         if (arg == L"--live") o.live = true;
         else if (arg == L"--help") o.help = true;
-        else if (arg == L"--model") o.model = value();
+        else if (arg == L"--model") { o.model = value(); o.explicitModel=true; }
         else if (arg == L"--image") o.image = value();
         else if (arg == L"--preview") o.preview = value();
         else if (arg == L"--profile") o.profile = value();
+        else if (arg == L"--no-avx2") o.scalar=true;
         else if (arg == L"--device") o.device = std::stoi(value());
         else if (arg == L"--roi") o.roi = std::stoi(value());
         else if (arg == L"--cooldown-ms") o.cooldown = std::stoi(value());
@@ -83,12 +88,24 @@ Options parse(int argc, wchar_t** argv) {
     if (!o.image.empty() && o.live) throw std::runtime_error("Image tests cannot use --live");
     if (!o.preview.empty() && o.image.empty()) throw std::runtime_error("--preview requires --image");
     if (o.captureTest && o.live) throw std::runtime_error("Capture tests cannot use --live");
+    if (!o.explicitModel && (!o.preview.empty() || !std::filesystem::exists(o.model)))
+        o.model=(modelDirectory/L"person-seg-320.onnx").wstring();
     return o;
 }
 
 struct Image {
     int width = 0, height = 0;
     std::vector<unsigned char> pixels;
+};
+class PollWait {
+    HANDLE timer_=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_MODIFY_STATE|SYNCHRONIZE);
+public:
+    ~PollWait(){ if(timer_) CloseHandle(timer_); }
+    void wait() {
+        LARGE_INTEGER due{}; due.QuadPart=-2000; // 0.2 ms, relative 100-nanosecond units.
+        if(timer_ && SetWaitableTimer(timer_,&due,0,nullptr,nullptr,FALSE)) WaitForSingleObject(timer_,5);
+        else Sleep(1);
+    }
 };
 Image loadImage(const std::wstring& path) {
     ComPtr<IWICImagingFactory> factory;
@@ -201,6 +218,44 @@ public:
 
 struct Person { int anchor; float score, x1, y1, x2, y2; };
 struct Result { bool hit = false; float confidence = 0, maskProbability = 0; int persons = 0; double preprocessMs = 0, inferenceMs = 0, postprocessMs = 0; };
+
+// AVX2 stays behind a runtime feature check; the rest of the executable uses SSE2.
+template<int Shift> inline __m256 component(__m256i pixels) {
+    return _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(pixels,Shift),_mm256_set1_epi32(255)));
+}
+template<int Shift> inline __m256 interpolate(__m256i a,__m256i b,__m256i c,__m256i d,__m256 fx,__m256 fy) {
+    const __m256 one=_mm256_set1_ps(1.0f);
+    const __m256 top=_mm256_add_ps(_mm256_mul_ps(_mm256_sub_ps(one,fx),component<Shift>(a)),_mm256_mul_ps(fx,component<Shift>(b)));
+    const __m256 bottom=_mm256_add_ps(_mm256_mul_ps(_mm256_sub_ps(one,fx),component<Shift>(c)),_mm256_mul_ps(fx,component<Shift>(d)));
+    return _mm256_div_ps(_mm256_add_ps(_mm256_mul_ps(_mm256_sub_ps(one,fy),top),_mm256_mul_ps(fy,bottom)),_mm256_set1_ps(255.0f));
+}
+__declspec(noinline) void preprocessAVX2(const Image& image,const int* axis0,const int* axis1,const float* weights,bool integerSampling,float* input) {
+    float* red=input; float* green=red+InputSize*InputSize; float* blue=green+InputSize*InputSize;
+    const __m256 normalization=_mm256_set1_ps(255.0f);
+    for(int y=0;y<InputSize;++y) {
+        const auto* row0=reinterpret_cast<const int*>(image.pixels.data()+size_t(axis0[y])*image.width*4);
+        const auto* row1=reinterpret_cast<const int*>(image.pixels.data()+size_t(axis1[y])*image.width*4);
+        const __m256 fy=_mm256_set1_ps(weights[y]);
+        for(int x=0;x<InputSize;x+=8) {
+            const auto indexes0=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(axis0+x));
+            const auto a=_mm256_i32gather_epi32(row0,indexes0,4);
+            const size_t offset=size_t(y)*InputSize+x;
+            if(integerSampling) {
+                _mm256_storeu_ps(red+offset,_mm256_div_ps(component<16>(a),normalization));
+                _mm256_storeu_ps(green+offset,_mm256_div_ps(component<8>(a),normalization));
+                _mm256_storeu_ps(blue+offset,_mm256_div_ps(component<0>(a),normalization));
+            } else {
+                const auto indexes1=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(axis1+x));
+                const auto b=_mm256_i32gather_epi32(row0,indexes1,4), c=_mm256_i32gather_epi32(row1,indexes0,4), d=_mm256_i32gather_epi32(row1,indexes1,4);
+                const auto fx=_mm256_loadu_ps(weights+x);
+                _mm256_storeu_ps(red+offset,interpolate<16>(a,b,c,d,fx,fy));
+                _mm256_storeu_ps(green+offset,interpolate<8>(a,b,c,d,fx,fy));
+                _mm256_storeu_ps(blue+offset,interpolate<0>(a,b,c,d,fx,fy));
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
 class Detector {
     Ort::Env environment_{ORT_LOGGING_LEVEL_WARNING, "person-seg"};
     Ort::Session session_{nullptr};
@@ -214,6 +269,14 @@ class Detector {
     std::array<std::string, 2> outputNames_;
     std::array<const char*, 2> outputNamePointers_{};
     std::vector<Person> candidates_, people_;
+    bool compact_ = false;
+    size_t outputCount_ = 2;
+    int resizeSide_ = 0;
+    std::array<int,InputSize> axis0_{}, axis1_{};
+    std::array<float,InputSize> axisWeight_{};
+    std::array<float,256> normalized_{};
+    bool integerSampling_ = false;
+    bool avx2_ = IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)!=0;
     float value(int channel, int anchor) const { return detections_[size_t(channel) * Anchors + anchor]; }
     float maskLogit(const Person& p, int x, int y) const {
         float sum = 0;
@@ -228,7 +291,8 @@ class Detector {
         return total > 0 ? intersection / total : 0;
     }
 public:
-    Detector(const std::wstring& path, int device, const std::wstring& profile) {
+    Detector(const std::wstring& path, int device, const std::wstring& profile, bool scalar) {
+        if(scalar) avx2_=false;
         Ort::SessionOptions options;
         options.DisableMemPattern(); options.SetExecutionMode(ORT_SEQUENTIAL);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -239,29 +303,33 @@ public:
         Ort::ThrowOnError(dml->SessionOptionsAppendExecutionProvider_DML(options, device));
         session_ = Ort::Session(environment_, path.c_str(), options);
         Ort::AllocatorWithDefaultOptions allocator;
-        if (session_.GetInputCount() != 1 || session_.GetOutputCount() != 2)
+        outputCount_=session_.GetOutputCount();
+        if (session_.GetInputCount() != 1 || (outputCount_ != 1 && outputCount_ != 2))
             throw std::runtime_error("Expected raw YOLOv8-seg ONNX model");
+        compact_=outputCount_==1;
         if (session_.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,3,320,320}
-            || session_.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,116,2100}
-            || session_.GetOutputTypeInfo(1).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,32,80,80})
+            || session_.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,compact_ ? 7 : 116,2100}
+            || (!compact_ && session_.GetOutputTypeInfo(1).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,32,80,80}))
             throw std::runtime_error("Model must use fixed 320 input and COCO 80-class YOLOv8 segmentation outputs");
         inputName_ = session_.GetInputNameAllocated(0, allocator).get();
-        for (size_t i = 0; i < 2; ++i) {
+        for (size_t i = 0; i < outputCount_; ++i) {
             outputNames_[i] = session_.GetOutputNameAllocated(i, allocator).get();
             outputNamePointers_[i] = outputNames_[i].c_str();
         }
         const std::array<int64_t,4> inputShape{1,3,320,320}, protoShape{1,32,80,80};
-        const std::array<int64_t,3> detectionShape{1,116,2100};
+        const std::array<int64_t,3> detectionShape{1,compact_ ? 7 : 116,2100};
+        detections_.resize(size_t(compact_ ? 7 : Channels)*Anchors);
         inputTensor_ = Ort::Value::CreateTensor<float>(memory_, input_.data(), input_.size(), inputShape.data(), inputShape.size());
         outputs_[0] = Ort::Value::CreateTensor<float>(memory_, detections_.data(), detections_.size(), detectionShape.data(), detectionShape.size());
-        outputs_[1] = Ort::Value::CreateTensor<float>(memory_, prototypes_.data(), prototypes_.size(), protoShape.data(), protoShape.size());
+        if (!compact_) outputs_[1] = Ort::Value::CreateTensor<float>(memory_, prototypes_.data(), prototypes_.size(), protoShape.data(), protoShape.size());
+        for(size_t i=0;i<normalized_.size();++i) normalized_[i]=float(i)/255.0f;
         candidates_.reserve(Anchors); people_.reserve(100);
-        std::cout << "Provider: DirectML | GPU index: " << device << " | input: 320x320\n";
+        std::cout << "Provider: DirectML | GPU index: " << device << " | input: 320x320 | compact_output=" << compact_ << " | AVX2=" << avx2_ << "\n";
         for (int i = 0; i < 8; ++i) run(); // Warm-up outside armed mode.
     }
     void run() {
         const char* name = inputName_.c_str();
-        session_.Run(Ort::RunOptions{nullptr}, &name, &inputTensor_, 1, outputNamePointers_.data(), outputs_.data(), outputs_.size());
+        session_.Run(Ort::RunOptions{nullptr}, &name, &inputTensor_, 1, outputNamePointers_.data(), outputs_.data(), outputCount_);
     }
     void finishProfile() {
         Ort::AllocatorWithDefaultOptions allocator;
@@ -269,6 +337,7 @@ public:
         std::cout << "Profile: " << file.get() << '\n';
     }
     float maskProbability(const Person& p, float x, float y) const {
+        if(compact_) return 1.0f/(1.0f+std::exp(-value(6,p.anchor)));
         // Same half-pixel alignment as bilinear mask upsampling (align_corners=false).
         const float px = std::clamp((x + .5f) * .25f - .5f, 0.0f, 79.0f);
         const float py = std::clamp((y + .5f) * .25f - .5f, 0.0f, 79.0f);
@@ -281,21 +350,35 @@ public:
     Result detect(const Image& image, float confidence) {
         if (image.width != image.height || image.width < 1) throw std::runtime_error("Square ROI required");
         const auto start = Clock::now();
-        const float scale = float(image.width) / InputSize;
-        for (int y = 0; y < InputSize; ++y) {
-            const float sy = std::clamp((y+.5f)*scale-.5f, 0.0f, float(image.height-1));
-            const int y0 = int(sy), y1 = std::min(y0+1,image.height-1); const float fy = sy-y0;
-            for (int x = 0; x < InputSize; ++x) {
-                const float sx = std::clamp((x+.5f)*scale-.5f, 0.0f, float(image.width-1));
-                const int x0 = int(sx), x1 = std::min(x0+1,image.width-1); const float fx = sx-x0;
-                const unsigned char* a = image.pixels.data()+(size_t(y0)*image.width+x0)*4;
-                const unsigned char* b = image.pixels.data()+(size_t(y0)*image.width+x1)*4;
-                const unsigned char* c = image.pixels.data()+(size_t(y1)*image.width+x0)*4;
-                const unsigned char* d = image.pixels.data()+(size_t(y1)*image.width+x1)*4;
-                for (int k = 0; k < 3; ++k)
-                    input_[size_t(k)*InputSize*InputSize+size_t(y)*InputSize+x] =
-                        ((1-fy)*((1-fx)*a[2-k]+fx*b[2-k])+fy*((1-fx)*c[2-k]+fx*d[2-k]))/255.0f;
+        if(resizeSide_!=image.width) {
+            resizeSide_=image.width; integerSampling_=true;
+            const float scale=float(image.width)/InputSize;
+            for(int i=0;i<InputSize;++i) {
+                const float coordinate=std::clamp((i+.5f)*scale-.5f,0.0f,float(image.width-1));
+                axis0_[i]=int(coordinate); axis1_[i]=std::min(axis0_[i]+1,image.width-1);
+                axisWeight_[i]=coordinate-axis0_[i];
+                if(axisWeight_[i]!=0) integerSampling_=false;
             }
+        }
+        if(avx2_) preprocessAVX2(image,axis0_.data(),axis1_.data(),axisWeight_.data(),integerSampling_,input_.data());
+        else {
+        auto* red=input_.data(); auto* green=red+InputSize*InputSize; auto* blue=green+InputSize*InputSize;
+        for (int y = 0; y < InputSize; ++y) {
+            const auto* row0=image.pixels.data()+size_t(axis0_[y])*image.width*4;
+            const auto* row1=image.pixels.data()+size_t(axis1_[y])*image.width*4;
+            const float fy=axisWeight_[y];
+            for (int x = 0; x < InputSize; ++x) {
+                const auto* a=row0+axis0_[x]*4;
+                const size_t destination=size_t(y)*InputSize+x;
+                if(integerSampling_) { red[destination]=normalized_[a[2]]; green[destination]=normalized_[a[1]]; blue[destination]=normalized_[a[0]]; }
+                else {
+                    const auto* b=row0+axis1_[x]*4; const auto* c=row1+axis0_[x]*4; const auto* d=row1+axis1_[x]*4;
+                    const float fx=axisWeight_[x];
+                    auto channel=[&](int k){ return ((1-fy)*((1-fx)*a[k]+fx*b[k])+fy*((1-fx)*c[k]+fx*d[k]))/255.0f; };
+                    red[destination]=channel(2); green[destination]=channel(1); blue[destination]=channel(0);
+                }
+            }
+        }
         }
         const auto prepared = Clock::now(); run(); const auto inferred = Clock::now();
         candidates_.clear(); people_.clear();
@@ -303,7 +386,8 @@ public:
             const float score = value(4,a); // COCO class 0 = person.
             if (score < confidence) continue;
             bool personClass = true;
-            for (int k = 5; k < 84; ++k) if (value(k,a) > score) { personClass = false; break; }
+            if(compact_) personClass=value(5,a)<=score;
+            else for (int k = 5; k < 84; ++k) if (value(k,a) > score) { personClass = false; break; }
             const float x = value(0,a), y = value(1,a), w = value(2,a), h = value(3,a);
             if (!personClass || !std::isfinite(x+y+w+h+score) || w <= 0 || h <= 0) continue;
             candidates_.push_back({a,score,x-w*.5f,y-h*.5f,x+w*.5f,y+h*.5f});
@@ -328,6 +412,7 @@ public:
         return result;
     }
     void preview(Image image, const std::wstring& path) const {
+        if(compact_) throw std::runtime_error("Full preview needs --model person-seg-320.onnx");
         // Diagnostic only. Full-mask rendering never runs in the live loop.
         const float scale = float(InputSize) / image.width;
         for (int y = 0; y < image.height; ++y) for (int x = 0; x < image.width; ++x) {
@@ -398,16 +483,19 @@ void listDevice(int index) {
 void imageTest(Detector& detector, const Options& options) {
     const Image crop=cropImage(loadImage(options.image),options.roi);
     Result result{};
-    std::vector<double> inference, total;
+    std::vector<double> inference, total, preprocessing, postprocessing;
     for (int i=0;i<options.benchmark;++i) {
         const auto started=Clock::now(); result=detector.detect(crop,options.confidence);
         total.push_back(milliseconds(Clock::now()-started)); inference.push_back(result.inferenceMs);
+        preprocessing.push_back(result.preprocessMs); postprocessing.push_back(result.postprocessMs);
     }
     std::cout << std::fixed << std::setprecision(3)
               << "persons=" << result.persons << " center_hit=" << result.hit
               << " person_confidence=" << result.confidence << " mask_probability=" << result.maskProbability << '\n'
               << "inference_ms median=" << percentile(inference,.5) << " p95=" << percentile(inference,.95)
               << " | crop_to_decision_ms median=" << percentile(total,.5) << " p95=" << percentile(total,.95) << '\n';
+    std::cout << "preprocess_ms median=" << percentile(preprocessing,.5) << " p95=" << percentile(preprocessing,.95)
+              << " | postprocess_ms median=" << percentile(postprocessing,.5) << " p95=" << percentile(postprocessing,.95) << '\n';
     if (!options.preview.empty()) detector.preview(crop,options.preview);
 }
 void captureTest(Detector& detector, const Options& options) {
@@ -415,11 +503,12 @@ void captureTest(Detector& detector, const Options& options) {
     HMONITOR monitor=MonitorFromPoint(center,MONITOR_DEFAULTTONEAREST);
     const int side=std::min({options.roi,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)}) & ~1;
     Capture capture(monitor,side); Image image;
+    PollWait poll;
     const auto deadline=Clock::now()+std::chrono::seconds(10);
     int frames=0; std::vector<double> times;
     while(frames<options.captureTest && Clock::now()<deadline) {
         LARGE_INTEGER timestamp{}; const auto start=Clock::now();
-        if (!capture.get(center,image,timestamp)) { Sleep(1); continue; }
+        if (!capture.get(center,image,timestamp)) { poll.wait(); continue; }
         const auto result=detector.detect(image,options.confidence);
         times.push_back(milliseconds(Clock::now()-start)); ++frames;
         if (frames==1) std::cout << "capture_test center_hit=" << result.hit << " (no input generated)\n";
@@ -438,6 +527,7 @@ void interactive(Detector& detector, const Options& options) {
     int captureSide=0;
     Image image;
     MousePulse mouse;
+    PollWait poll;
     auto nextClick=Clock::now(), lastLog=Clock::now();
     unsigned long long clicks=0, hits=0, frames=0, stale=0;
     while (!held(VK_F10)) {
@@ -446,12 +536,22 @@ void interactive(Detector& detector, const Options& options) {
             armed=!armed; target=armed ? GetForegroundWindow() : nullptr;
             if (target==GetConsoleWindow()) { armed=false; target=nullptr; }
             capture.reset(); nextClick=Clock::now();
+            if(armed) {
+                POINT initialCenter{}; int initialSide=0;
+                try {
+                    if(targetGeometry(target,initialCenter,initialSide,options.roi)) {
+                        capture=std::make_unique<Capture>(MonitorFromWindow(target,MONITOR_DEFAULTTONEAREST),initialSide);
+                        captureSide=initialSide;
+                    }
+                } catch(const std::exception& e) { std::cerr << e.what() << '\n'; armed=false; }
+            }
             std::cout << (armed ? "Armed.\n" : "Disarmed.\n");
         }
         f8Previous=f8;
         mouse.update(!armed || GetForegroundWindow()!=target || !held(VK_XBUTTON1));
-        if (mouse.pressed()) { Sleep(1); continue; }
-        if (!armed || GetForegroundWindow()!=target || !held(VK_XBUTTON1) || held(VK_LBUTTON)) { Sleep(2); continue; }
+        if (mouse.pressed()) { poll.wait(); continue; }
+        if (!armed || GetForegroundWindow()!=target) { Sleep(5); continue; }
+        if (!held(VK_XBUTTON1) || held(VK_LBUTTON)) { poll.wait(); continue; }
         POINT center{}; int side=0;
         if (!targetGeometry(target,center,side,options.roi)) { Sleep(5); continue; }
         try {
@@ -460,7 +560,7 @@ void interactive(Detector& detector, const Options& options) {
                 capture=std::make_unique<Capture>(monitor,side); captureSide=side;
             }
             LARGE_INTEGER timestamp{}; const auto started=Clock::now();
-            if (!capture->get(center,image,timestamp)) { Sleep(1); continue; }
+            if (!capture->get(center,image,timestamp)) { poll.wait(); continue; }
             if (qpcAge(timestamp)>options.maxAge) { ++stale; continue; }
             const auto result=detector.detect(image,options.confidence); ++frames;
             const double age=qpcAge(timestamp), elapsed=milliseconds(Clock::now()-started);
@@ -496,11 +596,12 @@ int wmain(int argc,wchar_t** argv) {
     try {
         const auto options=parse(argc,argv);
         if (options.help) {
-            std::cout << "gpu-trigger.exe [--live] [--confidence 0.45] [--roi 960] [--device 0]\n"
+            std::cout << "gpu-trigger.exe [--live] [--confidence 0.45] [--roi 640] [--device 0]\n"
                          "  [--cooldown-ms 100] [--hold-ms 8] [--max-age-ms 40] [--model path]\n"
                          "  --image path [--preview path.png] [--benchmark 60]: offline GPU test\n"
                          "  --capture-test 10: desktop capture benchmark, no mouse input\n"
                          "  --profile file-prefix: diagnostic ONNX Runtime profile\n"
+                         "  --no-avx2: use scalar preprocessing (automatically used on older CPUs)\n"
                          "Default: DRY RUN. F8: bind foreground window. Mouse4: activate. F10: exit.\n";
             return 0;
         }
@@ -508,7 +609,7 @@ int wmain(int argc,wchar_t** argv) {
         check(CoInitializeEx(nullptr,COINIT_MULTITHREADED),"COM initialization");
         struct ComCleanup { ~ComCleanup(){ CoUninitialize(); } } cleanup;
         listDevice(options.device);
-        Detector detector(options.model,options.device,options.profile);
+        Detector detector(options.model,options.device,options.profile,options.scalar);
         if (!options.image.empty()) imageTest(detector,options);
         else if (options.captureTest) captureTest(detector,options);
         else interactive(detector,options);

@@ -5,6 +5,7 @@ $crtRoot = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC
 $payloadFiles = @(
     @{ Name = 'gpu-trigger.exe'; Path = (Join-Path $projectRoot 'gpu-trigger.exe') },
     @{ Name = 'person-seg-320.onnx'; Path = (Join-Path $projectRoot 'person-seg-320.onnx') },
+    @{ Name = 'person-seg-fast-320.onnx'; Path = (Join-Path $projectRoot 'person-seg-fast-320.onnx') },
     @{ Name = 'onnxruntime.dll'; Path = (Join-Path $projectRoot 'onnxruntime.dll') },
     @{ Name = 'onnxruntime_providers_shared.dll'; Path = (Join-Path $projectRoot 'onnxruntime_providers_shared.dll') },
     @{ Name = 'DirectML.dll'; Path = (Join-Path $projectRoot 'DirectML.dll') }
