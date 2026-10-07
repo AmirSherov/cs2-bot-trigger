@@ -50,16 +50,21 @@ struct Options {
     int captureTest = 0;
     float confidence = 0.45f;
     double maxAge = 40;
-    std::wstring model, image, preview, profile;
+    std::wstring model, image, preview, profile, validate;
     bool explicitModel = false;
     bool scalar = false;
+    bool syncSpin = true;
+    bool cpuPipeline = false;
+    bool graphCapture = true;
+    std::wstring backend = L"auto";
 };
 Options parse(int argc, wchar_t** argv) {
     Options o;
     wchar_t executable[32768]{};
     if (!GetModuleFileNameW(nullptr, executable, 32768)) throw std::runtime_error("Cannot locate executable");
     const auto modelDirectory=std::filesystem::path(executable).parent_path();
-    o.model = (modelDirectory / L"person-seg-fast-320.onnx").wstring();
+    o.model = (modelDirectory / L"person-seg-center-fp16-320.onnx").wstring();
+    if(!std::filesystem::exists(o.model)) o.model=(modelDirectory/L"person-seg-fast-320.onnx").wstring();
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         auto value = [&]() -> std::wstring { if (++i >= argc) throw std::runtime_error("Missing argument value"); return argv[i]; };
@@ -69,7 +74,12 @@ Options parse(int argc, wchar_t** argv) {
         else if (arg == L"--image") o.image = value();
         else if (arg == L"--preview") o.preview = value();
         else if (arg == L"--profile") o.profile = value();
+        else if (arg == L"--validate") o.validate = value();
         else if (arg == L"--no-avx2") o.scalar=true;
+        else if (arg == L"--no-sync-spin") o.syncSpin=false;
+        else if (arg == L"--cpu-pipeline") o.cpuPipeline=true;
+        else if (arg == L"--no-graph-capture") o.graphCapture=false;
+        else if (arg == L"--backend") o.backend=value();
         else if (arg == L"--device") o.device = std::stoi(value());
         else if (arg == L"--roi") o.roi = std::stoi(value());
         else if (arg == L"--cooldown-ms") o.cooldown = std::stoi(value());
@@ -88,6 +98,11 @@ Options parse(int argc, wchar_t** argv) {
     if (!o.image.empty() && o.live) throw std::runtime_error("Image tests cannot use --live");
     if (!o.preview.empty() && o.image.empty()) throw std::runtime_error("--preview requires --image");
     if (o.captureTest && o.live) throw std::runtime_error("Capture tests cannot use --live");
+    if (!o.validate.empty() && (o.live || !o.image.empty() || o.captureTest))
+        throw std::runtime_error("--validate is an independent offline test mode");
+    if(o.backend!=L"auto" && o.backend!=L"directml" && o.backend!=L"tensorrt") throw std::runtime_error("Unknown backend");
+    if(o.backend==L"tensorrt" && (o.cpuPipeline || o.explicitModel || !o.preview.empty()))
+        throw std::runtime_error("TensorRT uses its bundled engine and GPU pipeline; use --backend directml with --model/--preview");
     if (!o.explicitModel && (!o.preview.empty() || !std::filesystem::exists(o.model)))
         o.model=(modelDirectory/L"person-seg-320.onnx").wstring();
     return o;
@@ -97,6 +112,8 @@ struct Image {
     int width = 0, height = 0;
     std::vector<unsigned char> pixels;
 };
+#include "gpu_pipeline.h"
+#include "tensorrt_backend.h"
 class PollWait {
     HANDLE timer_=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_MODIFY_STATE|SYNCHRONIZE);
 public:
@@ -151,11 +168,16 @@ class Capture {
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGIOutputDuplication> duplication_;
     ComPtr<ID3D11Texture2D> staging_;
+    ComPtr<ID3D11DeviceContext4> context4_;
+    ComPtr<ID3D11Fence> ready11_;
+    ComPtr<ID3D12Fence> ready12_;
+    GpuPipeline* gpu_ = nullptr;
+    UINT64 readyValue_ = 0;
     DXGI_OUTPUT_DESC output_{};
     int side_ = 0;
 public:
     HMONITOR monitor = nullptr;
-    Capture(HMONITOR wanted, int side) : side_(side), monitor(wanted) {
+    Capture(HMONITOR wanted, int side, GpuPipeline* gpu=nullptr) : gpu_(gpu), side_(side), monitor(wanted) {
         ComPtr<IDXGIFactory1> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
         ComPtr<IDXGIAdapter1> selectedAdapter;
         ComPtr<IDXGIOutput> selectedOutput;
@@ -184,7 +206,15 @@ public:
         desc.Width = desc.Height = UINT(side); desc.MipLevels = desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        check(device_->CreateTexture2D(&desc, nullptr, &staging_), "ROI staging texture");
+        if(gpu_) {
+            gpu_->shareTexture(device_.Get(),side,&staging_);
+            ComPtr<ID3D11Device5> device5; check(device_.As(&device5),"Capture fence device");
+            check(context_.As(&context4_),"Capture fence context");
+            check(device5->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&ready11_)),"Capture fence");
+            HANDLE handle=nullptr; check(ready11_->CreateSharedHandle(nullptr,GENERIC_ALL,nullptr,&handle),"Share capture fence");
+            const HRESULT hr=gpu_->device()->OpenSharedHandle(handle,IID_PPV_ARGS(&ready12_));
+            CloseHandle(handle); check(hr,"Open capture fence");
+        } else check(device_->CreateTexture2D(&desc, nullptr, &staging_), "ROI staging texture");
     }
     bool get(POINT center, Image& image, LARGE_INTEGER& timestamp) {
         const LONG left = center.x - side_ / 2 - output_.DesktopCoordinates.left;
@@ -203,7 +233,14 @@ public:
         timestamp = info.LastPresentTime;
         ComPtr<ID3D11Texture2D> texture; check(resource.As(&texture), "Frame texture");
         D3D11_BOX box{UINT(left), UINT(top), 0, UINT(left + side_), UINT(top + side_), 1};
+        if(gpu_) gpu_->wait(); // A stale frame may have skipped inference/readback.
         context_->CopySubresourceRegion(staging_.Get(), 0, 0, 0, 0, texture.Get(), 0, &box);
+        if(gpu_) {
+            check(context4_->Signal(ready11_.Get(),++readyValue_),"Signal capture"); context_->Flush();
+            gpu_->prepareShared(ready12_.Get(),readyValue_);
+            image.width=image.height=side_;
+            return true;
+        }
         D3D11_MAPPED_SUBRESOURCE mapped{};
         check(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map ROI");
         struct Unmap { ID3D11DeviceContext* c; ID3D11Texture2D* t; ~Unmap() { c->Unmap(t, 0); } } unmap{context_.Get(), staging_.Get()};
@@ -258,7 +295,11 @@ __declspec(noinline) void preprocessAVX2(const Image& image,const int* axis0,con
 }
 class Detector {
     Ort::Env environment_{ORT_LOGGING_LEVEL_WARNING, "person-seg"};
+    std::unique_ptr<GpuPipeline> gpu_;
     Ort::Session session_{nullptr};
+    std::unique_ptr<Ort::IoBinding> binding_;
+    std::unique_ptr<TensorRtBackend> trt_;
+    Ort::RunOptions runOptions_;
     Ort::MemoryInfo memory_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::vector<float> input_ = std::vector<float>(3 * InputSize * InputSize);
     std::vector<float> detections_ = std::vector<float>(Channels * Anchors);
@@ -291,12 +332,14 @@ class Detector {
         return total > 0 ? intersection / total : 0;
     }
 public:
-    Detector(const std::wstring& path, int device, const std::wstring& profile, bool scalar) {
+    Detector(const std::wstring& path, int device, const std::wstring& profile, bool scalar, bool syncSpin,
+             bool cpuPipeline, bool graphCapture, const std::wstring& backend=L"directml") {
         if(scalar) avx2_=false;
         Ort::SessionOptions options;
         options.DisableMemPattern(); options.SetExecutionMode(ORT_SEQUENTIAL);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         options.SetIntraOpNumThreads(1); options.SetInterOpNumThreads(1);
+        options.AddConfigEntry("ep.dml.enable_cpu_sync_spinning", syncSpin ? "1" : "0");
         if (!profile.empty()) options.EnableProfiling(profile.c_str());
         const OrtDmlApi* dml = nullptr;
         Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dml)));
@@ -307,6 +350,19 @@ public:
         if (session_.GetInputCount() != 1 || (outputCount_ != 1 && outputCount_ != 2))
             throw std::runtime_error("Expected raw YOLOv8-seg ONNX model");
         compact_=outputCount_==1;
+        if(!cpuPipeline && compact_) {
+            session_=Ort::Session{nullptr};
+            gpu_=std::make_unique<GpuPipeline>(device,syncSpin);
+            Ort::SessionOptions gpuOptions;
+            gpuOptions.DisableMemPattern(); gpuOptions.SetExecutionMode(ORT_SEQUENTIAL);
+            gpuOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            gpuOptions.SetIntraOpNumThreads(1); gpuOptions.SetInterOpNumThreads(1);
+            gpuOptions.AddConfigEntry("ep.dml.enable_cpu_sync_spinning",syncSpin ? "1" : "0");
+            if(!profile.empty()) gpuOptions.EnableProfiling(profile.c_str());
+            gpu_->configure(gpuOptions,graphCapture);
+            session_=Ort::Session(environment_,path.c_str(),gpuOptions);
+            runOptions_.AddConfigEntry("disable_synchronize_execution_providers","1");
+        }
         if (session_.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,3,320,320}
             || session_.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,compact_ ? 7 : 116,2100}
             || (!compact_ && session_.GetOutputTypeInfo(1).GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1,32,80,80}))
@@ -324,10 +380,31 @@ public:
         if (!compact_) outputs_[1] = Ort::Value::CreateTensor<float>(memory_, prototypes_.data(), prototypes_.size(), protoShape.data(), protoShape.size());
         for(size_t i=0;i<normalized_.size();++i) normalized_[i]=float(i)/255.0f;
         candidates_.reserve(Anchors); people_.reserve(100);
-        std::cout << "Provider: DirectML | GPU index: " << device << " | input: 320x320 | compact_output=" << compact_ << " | AVX2=" << avx2_ << "\n";
+        if(gpu_) {
+            binding_=std::make_unique<Ort::IoBinding>(session_);
+            gpu_->bind(*binding_,inputName_.c_str(),outputNames_[0].c_str());
+            gpu_->prepare(Image{InputSize,InputSize,std::vector<unsigned char>(size_t(InputSize)*InputSize*4)});
+            if(backend!=L"directml") {
+                wchar_t executable[32768]{}; GetModuleFileNameW(nullptr,executable,32768);
+                const auto engine=std::filesystem::path(executable).parent_path()/L"person-seg-rtx4060.engine";
+                try { trt_=std::make_unique<TensorRtBackend>(*gpu_,engine); }
+                catch(const std::exception& e) {
+                    if(backend==L"tensorrt") throw;
+                    std::cerr << "TensorRT unavailable, using DirectML: " << e.what() << '\n';
+                }
+            }
+        }
+        std::cout << "Provider: " << (trt_ ? "TensorRT FP16" : "DirectML") << " | GPU index: " << device << " | input: 320x320 | compact_output=" << compact_
+                  << " | AVX2=" << avx2_ << " | gpu_pipeline=" << bool(gpu_) << " | graph_capture=" << (bool(gpu_) && graphCapture) << "\n";
         for (int i = 0; i < 8; ++i) run(); // Warm-up outside armed mode.
     }
+    GpuPipeline* gpu() const { return gpu_.get(); }
     void run() {
+        if(gpu_) {
+            if(trt_) trt_->run(); else session_.Run(runOptions_,*binding_);
+            gpu_->read(detections_.data());
+            return;
+        }
         const char* name = inputName_.c_str();
         session_.Run(Ort::RunOptions{nullptr}, &name, &inputTensor_, 1, outputNamePointers_.data(), outputs_.data(), outputCount_);
     }
@@ -347,9 +424,12 @@ public:
                           + fy*((1-fx)*maskLogit(p,x0,y1)+fx*maskLogit(p,x1,y1));
         return 1.0f / (1.0f + std::exp(-logit));
     }
-    Result detect(const Image& image, float confidence) {
+    Result detect(const Image& image, float confidence, bool captured=false) {
         if (image.width != image.height || image.width < 1) throw std::runtime_error("Square ROI required");
         const auto start = Clock::now();
+        if(gpu_) {
+            if(!captured) gpu_->prepare(image);
+        } else {
         if(resizeSide_!=image.width) {
             resizeSide_=image.width; integerSampling_=true;
             const float scale=float(image.width)/InputSize;
@@ -378,6 +458,7 @@ public:
                     red[destination]=channel(2); green[destination]=channel(1); blue[destination]=channel(0);
                 }
             }
+        }
         }
         }
         const auto prepared = Clock::now(); run(); const auto inferred = Clock::now();
@@ -498,18 +579,52 @@ void imageTest(Detector& detector, const Options& options) {
               << " | postprocess_ms median=" << percentile(postprocessing,.5) << " p95=" << percentile(postprocessing,.95) << '\n';
     if (!options.preview.empty()) detector.preview(crop,options.preview);
 }
+void validateSequence(Detector& detector, const Options& options) {
+    wchar_t executable[32768]{}; GetModuleFileNameW(nullptr,executable,32768);
+    const auto referencePath=std::filesystem::path(executable).parent_path()/L"person-seg-fast-320.onnx";
+    Detector reference(referencePath.wstring(),options.device,L"",true,false,true,false);
+    const std::array<std::pair<const wchar_t*,bool>,5> cases{{{L"person-near.png",true},{L"wall.png",false},
+        {L"person-group.png",true},{L"legs-gap-corrected.png",false},{L"sky-wall.png",false}}};
+    int checked=0, mismatches=0; float maxConfidenceError=0, maxMaskError=0;
+    for(int side : {640,960}) for(float brightness : {.7f,1.0f,1.3f}) for(int shift : {-32,-16,0,16,32}) {
+        for(const auto& item : cases) {
+            Image source=loadImage((std::filesystem::path(options.validate)/item.first).wstring());
+            Image transformed=source;
+            for(int y=0;y<source.height;++y) for(int x=0;x<source.width;++x) {
+                const int sx=std::clamp(x+shift,0,source.width-1);
+                for(int c=0;c<3;++c) transformed.pixels[(size_t(y)*source.width+x)*4+c]=
+                    static_cast<unsigned char>(std::clamp(source.pixels[(size_t(y)*source.width+sx)*4+c]*brightness,0.0f,255.0f));
+            }
+            const auto crop=cropImage(transformed,side);
+            const auto expected=reference.detect(crop,options.confidence);
+            const auto actual=detector.detect(crop,options.confidence);
+            const bool original=brightness==1.0f && shift==0;
+            if(expected.hit!=actual.hit || (original && actual.hit!=item.second)) {
+                ++mismatches;
+                std::wcout << L"MISMATCH " << item.first << L" roi=" << side << L" brightness=" << brightness << L" shift=" << shift
+                           << L" reference=" << expected.hit << L" actual=" << actual.hit << L'\n';
+            }
+            maxConfidenceError=std::max(maxConfidenceError,std::abs(expected.confidence-actual.confidence));
+            maxMaskError=std::max(maxMaskError,std::abs(expected.maskProbability-actual.maskProbability));
+            ++checked;
+        }
+    }
+    std::cout << "sequence_validation cases=" << checked << " mismatches=" << mismatches
+              << " max_confidence_error=" << maxConfidenceError << " max_mask_error=" << maxMaskError << '\n';
+    if(mismatches) throw std::runtime_error("Sequence validation failed");
+}
 void captureTest(Detector& detector, const Options& options) {
     POINT center{GetSystemMetrics(SM_CXSCREEN)/2,GetSystemMetrics(SM_CYSCREEN)/2};
     HMONITOR monitor=MonitorFromPoint(center,MONITOR_DEFAULTTONEAREST);
     const int side=std::min({options.roi,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)}) & ~1;
-    Capture capture(monitor,side); Image image;
+    Capture capture(monitor,side,detector.gpu()); Image image;
     PollWait poll;
     const auto deadline=Clock::now()+std::chrono::seconds(10);
     int frames=0; std::vector<double> times;
     while(frames<options.captureTest && Clock::now()<deadline) {
         LARGE_INTEGER timestamp{}; const auto start=Clock::now();
         if (!capture.get(center,image,timestamp)) { poll.wait(); continue; }
-        const auto result=detector.detect(image,options.confidence);
+        const auto result=detector.detect(image,options.confidence,true);
         times.push_back(milliseconds(Clock::now()-start)); ++frames;
         if (frames==1) std::cout << "capture_test center_hit=" << result.hit << " (no input generated)\n";
     }
@@ -540,7 +655,7 @@ void interactive(Detector& detector, const Options& options) {
                 POINT initialCenter{}; int initialSide=0;
                 try {
                     if(targetGeometry(target,initialCenter,initialSide,options.roi)) {
-                        capture=std::make_unique<Capture>(MonitorFromWindow(target,MONITOR_DEFAULTTONEAREST),initialSide);
+                        capture=std::make_unique<Capture>(MonitorFromWindow(target,MONITOR_DEFAULTTONEAREST),initialSide,detector.gpu());
                         captureSide=initialSide;
                     }
                 } catch(const std::exception& e) { std::cerr << e.what() << '\n'; armed=false; }
@@ -557,12 +672,12 @@ void interactive(Detector& detector, const Options& options) {
         try {
             HMONITOR monitor=MonitorFromWindow(target,MONITOR_DEFAULTTONEAREST);
             if (!capture || capture->monitor!=monitor || captureSide!=side) {
-                capture=std::make_unique<Capture>(monitor,side); captureSide=side;
+                capture=std::make_unique<Capture>(monitor,side,detector.gpu()); captureSide=side;
             }
             LARGE_INTEGER timestamp{}; const auto started=Clock::now();
             if (!capture->get(center,image,timestamp)) { poll.wait(); continue; }
             if (qpcAge(timestamp)>options.maxAge) { ++stale; continue; }
-            const auto result=detector.detect(image,options.confidence); ++frames;
+            const auto result=detector.detect(image,options.confidence,true); ++frames;
             const double age=qpcAge(timestamp), elapsed=milliseconds(Clock::now()-started);
             const auto now=Clock::now();
             if (result.hit) ++hits;
@@ -602,6 +717,11 @@ int wmain(int argc,wchar_t** argv) {
                          "  --capture-test 10: desktop capture benchmark, no mouse input\n"
                          "  --profile file-prefix: diagnostic ONNX Runtime profile\n"
                          "  --no-avx2: use scalar preprocessing (automatically used on older CPUs)\n"
+                         "  --backend auto|tensorrt|directml: auto tries bundled RTX 4060 engine\n"
+                         "  --cpu-pipeline: CPU preprocessing/readback fallback (DirectML)\n"
+                         "  --no-sync-spin: save CPU while waiting for GPU completion\n"
+                         "  --no-graph-capture: disable DirectML graph replay\n"
+                         "  --validate tests: compare 150 changing images with FP32 reference, no input\n"
                          "Default: DRY RUN. F8: bind foreground window. Mouse4: activate. F10: exit.\n";
             return 0;
         }
@@ -609,8 +729,10 @@ int wmain(int argc,wchar_t** argv) {
         check(CoInitializeEx(nullptr,COINIT_MULTITHREADED),"COM initialization");
         struct ComCleanup { ~ComCleanup(){ CoUninitialize(); } } cleanup;
         listDevice(options.device);
-        Detector detector(options.model,options.device,options.profile,options.scalar);
+        Detector detector(options.model,options.device,options.profile,options.scalar,options.syncSpin,options.cpuPipeline,options.graphCapture,
+                          options.explicitModel || !options.preview.empty() ? L"directml" : options.backend);
         if (!options.image.empty()) imageTest(detector,options);
+        else if (!options.validate.empty()) validateSequence(detector,options);
         else if (options.captureTest) captureTest(detector,options);
         else interactive(detector,options);
         if (!options.profile.empty()) detector.finishProfile();

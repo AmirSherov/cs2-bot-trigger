@@ -15,4 +15,5 @@ destination = root.parent / 'person-seg-320.onnx'
 shutil.copy2(exported, destination)
 print(destination)
 subprocess.run([sys.executable, str(root / 'optimize_model.py')], check=True)
+subprocess.run([sys.executable, str(root / 'optimize_center.py')], check=True)
 

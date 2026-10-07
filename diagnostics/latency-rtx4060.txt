@@ -1,0 +1,24 @@
+﻿BASELINE person-near.png
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.972
+inference_ms median=1.587 p95=2.061 | crop_to_decision_ms median=1.765 p95=2.282
+preprocess_ms median=0.168 p95=0.214 | postprocess_ms median=0.002 p95=0.002
+NEW person-near.png
+GPU: NVIDIA GeForce RTX 4060
+Provider: TensorRT FP16 | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1 | gpu_pipeline=1 | graph_capture=1
+persons=1 center_hit=1 person_confidence=0.840 mask_probability=0.975
+inference_ms median=0.856 p95=1.078 | crop_to_decision_ms median=0.967 p95=1.260
+preprocess_ms median=0.108 p95=0.264 | postprocess_ms median=0.001 p95=0.002
+BASELINE person-group.png
+GPU: NVIDIA GeForce RTX 4060
+Provider: DirectML | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1
+persons=4 center_hit=1 person_confidence=0.628 mask_probability=0.755
+inference_ms median=1.561 p95=1.819 | crop_to_decision_ms median=1.744 p95=2.232
+preprocess_ms median=0.181 p95=0.396 | postprocess_ms median=0.002 p95=0.005
+NEW person-group.png
+GPU: NVIDIA GeForce RTX 4060
+Provider: TensorRT FP16 | GPU index: 0 | input: 320x320 | compact_output=1 | AVX2=1 | gpu_pipeline=1 | graph_capture=1
+persons=4 center_hit=1 person_confidence=0.626 mask_probability=0.762
+inference_ms median=0.852 p95=0.880 | crop_to_decision_ms median=0.949 p95=1.055
+preprocess_ms median=0.093 p95=0.178 | postprocess_ms median=0.001 p95=0.003

@@ -25,8 +25,9 @@ if ($Extended) {
             $file = Join-Path (Join-Path $PSScriptRoot 'tests') $case.File
             $reference = $null
             foreach ($variant in @('fast-avx2','fast-scalar','full-avx2','full-scalar')) {
-                $arguments = @('--image',$file,'--benchmark','3','--roi',$roi.ToString())
+                $arguments = @('--image',$file,'--benchmark','3','--roi',$roi.ToString(),'--backend','directml','--cpu-pipeline')
                 if ($variant -like 'full-*') { $arguments += @('--model',(Join-Path $PSScriptRoot 'person-seg-320.onnx')) }
+                else { $arguments += @('--model',(Join-Path $PSScriptRoot 'person-seg-fast-320.onnx')) }
                 if ($variant -like '*-scalar') { $arguments += '--no-avx2' }
                 $result = & $program @arguments 2>&1
                 if ($LASTEXITCODE -ne 0) { throw "Runtime failed: $($case.File) $variant" }
